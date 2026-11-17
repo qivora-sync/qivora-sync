@@ -1,10 +1,16 @@
 {
   "name": "qivora-sync",
-  "version": "2.0.0",
+  "version": "2.1.2",
   "private": true,
-  "description": "QIVORA PostgreSQL sync service",
+  "description": "QIVORA PostgreSQL sync service with Apple Pay Shortcut bridge and additive Neon schema migration",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "pg": "^8.13.1" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
 }
