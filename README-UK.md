@@ -1,8 +1,9 @@
-# QIVORA Sync 2.1.2 — Neon + Apple Pay
+# QIVORA Sync 2.1.3 — Neon + Apple Pay
 
 ## Що є у цій версії
 - PostgreSQL sync API: `/auth/register`, `/auth/login`, `/sync/push`, `/sync/pull`.
 - Apple Pay bridge: `/applepay/status`, `/applepay/setup` (POST/DELETE), `/applepay/transactions`.
+- Видалення акаунта: `DELETE /account` (потрібен Bearer JWT і JSON `{ "confirmation": "Видалити" }`). Видаляє запис користувача транзакційно; пов’язані sync state та Apple Pay дані видаляються через `ON DELETE CASCADE`.
 - Реєстрація використовує одну PostgreSQL-транзакцію через `pool.connect()`.
 - Ідемпотентність Apple Pay за `eventId`.
 - Ключ Apple Pay зберігається у БД лише як SHA-256 хеш.

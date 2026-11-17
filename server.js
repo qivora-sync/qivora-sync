@@ -190,6 +190,21 @@ const server = http.createServer(async (req,res) => {
 
     const auth=requireAuth(req); if(!auth) return send(res,401,{error:'unauthorized'});
 
+    if (url.pathname === '/account' && req.method === 'DELETE') {
+      const input = await body(req);
+      if (input.confirmation !== 'Видалити') return send(res,400,{error:'confirmation-required'});
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const removed = await client.query('DELETE FROM qivora_users WHERE id=$1 RETURNING id',[auth.sub]);
+        if (!removed.rowCount) { await client.query('ROLLBACK'); return send(res,404,{error:'account-not-found'}); }
+        // Sync state, Apple Pay keys and events are removed by their user_id ON DELETE CASCADE constraints.
+        await client.query('COMMIT');
+      } catch (e) { await client.query('ROLLBACK').catch(()=>{}); throw e; }
+      finally { client.release(); }
+      return send(res,200,{ok:true,deleted:true});
+    }
+
     if (url.pathname === '/applepay/status' && req.method === 'GET') {
       const r=await pool.query('SELECT scope_id,created_at FROM qivora_applepay_keys WHERE user_id=$1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1',[auth.sub]);
       return send(res,200,{enabled:!!r.rowCount,scopeId:r.rows[0]?.scope_id||null,createdAt:r.rows[0]?.created_at||null});
