@@ -1,4 +1,4 @@
-# QIVORA Sync 2.2.0 — Neon + Apple Pay + Passkeys
+# QIVORA Sync 2.3.1 — Neon + Email OTP + Passkeys
 
 ## Що є у цій версії
 - PostgreSQL sync API: `/auth/register`, `/auth/login`, `/sync/push`, `/sync/pull`.
@@ -61,3 +61,34 @@ Environment:
 Код діє 10 хвилин; повторне надсилання обмежене 1 разом на хвилину; після 5 неправильних спроб код блокується. Нові OTP-акаунти створюються без пароля. Існуючі password-акаунти залишаються сумісними.
 
 Гостьовий режим є локальним і не створює серверного акаунта. Автоматичне об'єднання гостьових даних з уже існуючим акаунтом ще не реалізоване.
+
+
+## QIVORA Sync 2.3.1 — захист запитів та CORS
+- CORS більше не використовує `Access-Control-Allow-Origin: *`; браузерні запити дозволяються лише з `QIVORA_WEB_ORIGINS` / `QIVORA_WEB_ORIGIN`.
+- Додано обмеження частоти запитів за IP та email для Email OTP.
+- Додано базові обмеження за IP для реєстрації та входу за паролем.
+- Ліміти реалізовані в пам'яті одного процесу. Перед горизонтальним масштабуванням потрібно перенести лічильники в спільне сховище.
+- Уточнено версію документації відповідно до `package.json`.
+
+Збережи в Render `QIVORA_WEB_ORIGIN` або задай `QIVORA_WEB_ORIGINS` зі списком точних дозволених HTTPS-origin. Не додавай шлях або кінцевий `/`; вказується лише origin, наприклад `https://example.netlify.app`.
+
+
+## Google Sign-In (2.4.0)
+
+Google login uses Google Identity Services in the browser: the frontend receives a Google ID token (credential) and sends it to `POST /auth/google`. The backend verifies the token signature, issuer, expiry and audience with `google-auth-library`, and requires `email_verified=true`.
+
+Required Render environment variable:
+- `GOOGLE_CLIENT_ID` — the Web application OAuth Client ID from Google Cloud.
+
+Frontend request:
+```json
+{ "credential": "<Google ID token>" }
+```
+Endpoint response follows the existing QIVORA auth shape:
+```json
+{ "token": "<QIVORA token>", "userId": "<uuid>", "email": "user@example.com", "provider": "google" }
+```
+
+This credential-post flow does not use an OAuth redirect URI, so the Google Cloud OAuth web client can leave "Authorized redirect URIs" empty. Keep the QIVORA Netlify origin in "Authorized JavaScript origins". Do not expose a Google Client Secret in frontend code; this flow does not require one.
+
+Existing accounts with the same verified email are signed into the same QIVORA user record. New Google users receive a QIVORA user record and an empty sync snapshot. This does not merge a separate guest/local snapshot automatically; guest-data migration remains a separate frontend workflow.

@@ -1,8 +1,8 @@
 {
   "name": "qivora-sync",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "private": true,
-  "description": "QIVORA sync API with Passkeys, email OTP, and local-first guest support",
+  "description": "QIVORA sync API with Google Identity, Passkeys, email OTP, and local-first guest support",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "pg": "^8.13.1",
-    "@simplewebauthn/server": "^13.2.3"
+    "@simplewebauthn/server": "^13.2.3",
+    "google-auth-library": "^9.15.1"
   }
 }

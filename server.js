@@ -3,16 +3,19 @@
 const http = require('http');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { OAuth2Client } = require('google-auth-library');
 const { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } = require('@simplewebauthn/server');
 
 const PORT = Number(process.env.PORT || 8787);
 const SECRET = process.env.QIVORA_JWT_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const RP_ID = process.env.QIVORA_RP_ID || 'qivora-semolina-8700b2.netlify.app';
 const RP_IDS = String(process.env.QIVORA_RP_IDS || RP_ID).split(',').map(x=>x.trim()).filter(Boolean);
 const WEB_ORIGINS = String(process.env.QIVORA_WEB_ORIGINS || process.env.QIVORA_WEB_ORIGIN || 'https://qivora-semolina-8700b2.netlify.app').split(',').map(x=>x.trim()).filter(Boolean);
 if (!SECRET || SECRET.length < 32) throw new Error('QIVORA_JWT_SECRET must be set to a random value of at least 32 characters');
 if (!DATABASE_URL) throw new Error('DATABASE_URL is required');
+const googleOAuthClient = new OAuth2Client(GOOGLE_CLIENT_ID || undefined);
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 });
 
 const b64 = x => Buffer.from(x).toString('base64url');
@@ -33,7 +36,40 @@ function passwordHash(password, salt = crypto.randomBytes(16)) {
   return new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64*1024*1024 }, (err, key) => err ? reject(err) : resolve({ salt: salt.toString('hex'), hash: key.toString('hex') })));
 }
 function safeEqualHex(a,b) { try { const x=Buffer.from(a,'hex'), y=Buffer.from(b,'hex'); return x.length===y.length && crypto.timingSafeEqual(x,y); } catch { return false; } }
-function send(res, status, obj) { res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store', 'Access-Control-Allow-Origin':'*', 'Access-Control-Allow-Headers':'Content-Type, Authorization', 'Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS' }); res.end(JSON.stringify(obj)); }
+function send(res, status, obj) { res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' }); res.end(JSON.stringify(obj)); }
+
+// Small per-instance abuse guard. For multi-instance deployments, move these
+// counters to a shared store (e.g. PostgreSQL/Redis) before scaling horizontally.
+const rateBuckets = new Map();
+function clientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.socket.remoteAddress || 'unknown';
+}
+function rateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) bucket = { count: 0, resetAt: now + windowMs };
+  bucket.count += 1;
+  rateBuckets.set(key, bucket);
+  return bucket.count <= limit ? null : Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateBuckets) if (now >= bucket.resetAt) rateBuckets.delete(key);
+}, 5 * 60 * 1000).unref?.();
+
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // native clients and server-to-server calls
+  if (!WEB_ORIGINS.includes(origin)) return false;
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Max-Age', '600');
+  return true;
+}
+
 async function body(req) { let raw=''; for await (const chunk of req) { raw += chunk; if (Buffer.byteLength(raw, 'utf8') > 2_000_000) throw Object.assign(new Error('body-too-large'), { status:413 }); } try { return JSON.parse(raw || '{}'); } catch { throw Object.assign(new Error('invalid-json'), { status:400 }); } }
 async function initDb() {
   // Existing Neon qivora_users table was created without password_salt.
@@ -150,15 +186,70 @@ async function clearWebAuthnChallenge(userId, kind) {
   await pool.query('DELETE FROM qivora_webauthn_challenges WHERE user_id=$1 AND kind=$2',[userId,kind]);
 }
 const server = http.createServer(async (req,res) => {
-  if (req.method === 'OPTIONS') return send(res,204,{});
+  if (!applyCors(req,res)) return send(res,403,{error:'origin-not-allowed'});
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url,'http://localhost');
   try {
     if (url.pathname === '/health' && req.method === 'GET') {
       await pool.query('SELECT 1'); return send(res,200,{ ok:true, database:'connected' });
     }
+    if (url.pathname === '/auth/google' && req.method === 'POST') {
+      const wait=rateLimit(`google-auth-ip:${clientIp(req)}`,30,15*60*1000);
+      if(wait) return send(res,429,{error:'rate-limited',retryAfter:wait});
+      if(!GOOGLE_CLIENT_ID) return send(res,503,{error:'google-auth-not-configured'});
+      const input=await body(req);
+      const idToken=String(input.credential || input.idToken || '');
+      if(!idToken || idToken.length>10000) return send(res,400,{error:'missing-google-credential'});
+      let payload;
+      try {
+        const ticket=await googleOAuthClient.verifyIdToken({idToken,audience:GOOGLE_CLIENT_ID});
+        payload=ticket.getPayload();
+      } catch {
+        return send(res,401,{error:'invalid-google-credential'});
+      }
+      const email=String(payload?.email || '').trim().toLowerCase();
+      if(!payload?.sub || payload.email_verified!==true || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return send(res,401,{error:'google-email-not-verified'});
+      }
+      const client=await pool.connect(); let user;
+      try {
+        await client.query('BEGIN');
+        const found=await client.query('SELECT id,email FROM qivora_users WHERE email=$1 FOR UPDATE',[email]);
+        if(found.rowCount) {
+          user=found.rows[0];
+        } else {
+          const id=crypto.randomUUID();
+          const created=await client.query(
+            'INSERT INTO qivora_users(id,email,password_hash,password_salt) VALUES($1,$2,NULL,NULL) RETURNING id,email',
+            [id,email]
+          );
+          user=created.rows[0];
+          await client.query('INSERT INTO qivora_sync_state(user_id,data) VALUES($1,$2::jsonb)',[id,'{}']);
+        }
+        await client.query('COMMIT');
+      } catch(e) {
+        await client.query('ROLLBACK').catch(()=>{});
+        // Concurrent first sign-ins can race on the unique email constraint.
+        if(e.code==='23505') {
+          const existing=await pool.query('SELECT id,email FROM qivora_users WHERE email=$1',[email]);
+          if(existing.rowCount) user=existing.rows[0];
+          else throw e;
+        } else throw e;
+      } finally { client.release(); }
+      if(!user) {
+        const existing=await pool.query('SELECT id,email FROM qivora_users WHERE email=$1',[email]);
+        if(!existing.rowCount) return send(res,500,{error:'google-account-create-failed'});
+        user=existing.rows[0];
+      }
+      return send(res,200,{token:signToken({id:user.id,email:user.email}),userId:user.id,email:user.email,provider:'google'});
+    }
+
     if (url.pathname === '/auth/email-otp/request' && req.method === 'POST') {
       const input=await body(req), email=String(input.email||'').trim().toLowerCase();
       if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length>254) return send(res,400,{error:'invalid-email'});
+      const ipWait=rateLimit(`otp-request-ip:${clientIp(req)}`,10,60*60*1000);
+      const emailWait=rateLimit(`otp-request-email:${email}`,5,60*60*1000);
+      if(ipWait || emailWait) return send(res,429,{error:'otp-rate-limited',retryAfter:Math.max(ipWait||0,emailWait||0)});
       const recent=await pool.query('SELECT sent_at FROM qivora_email_otps WHERE email=$1',[email]);
       if(recent.rowCount && Date.now()-new Date(recent.rows[0].sent_at).getTime()<60_000) return send(res,429,{error:'otp-rate-limited',retryAfter:60});
       const code=String(crypto.randomInt(0,1_000_000)).padStart(6,'0');
@@ -169,6 +260,9 @@ const server = http.createServer(async (req,res) => {
     if (url.pathname === '/auth/email-otp/verify' && req.method === 'POST') {
       const input=await body(req), email=String(input.email||'').trim().toLowerCase(), code=String(input.code||'').trim();
       if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(code)) return send(res,400,{error:'invalid-code'});
+      const ipWait=rateLimit(`otp-verify-ip:${clientIp(req)}`,20,15*60*1000);
+      const emailWait=rateLimit(`otp-verify-email:${email}`,10,15*60*1000);
+      if(ipWait || emailWait) return send(res,429,{error:'otp-verify-rate-limited',retryAfter:Math.max(ipWait||0,emailWait||0)});
       const client=await pool.connect(); let user;
       try {
         await client.query('BEGIN');
@@ -186,6 +280,8 @@ const server = http.createServer(async (req,res) => {
     }
 
     if (url.pathname === '/auth/register' && req.method === 'POST') {
+      const wait=rateLimit(`register-ip:${clientIp(req)}`,15,15*60*1000);
+      if(wait) return send(res,429,{error:'rate-limited',retryAfter:wait});
       const { email: rawEmail, password } = await body(req);
       const email = String(rawEmail || '').trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || typeof password !== 'string' || password.length < 8 || password.length > 256) return send(res,400,{error:'bad-input',message:'Valid email and password (8+ characters) required'});
@@ -197,6 +293,8 @@ const server = http.createServer(async (req,res) => {
       return send(res,201,{token:signToken({id,email}),userId:id});
     }
     if (url.pathname === '/auth/login' && req.method === 'POST') {
+      const wait=rateLimit(`login-ip:${clientIp(req)}`,30,15*60*1000);
+      if(wait) return send(res,429,{error:'rate-limited',retryAfter:wait});
       const { email: rawEmail, password } = await body(req); const email=String(rawEmail||'').trim().toLowerCase();
       const result=await pool.query('SELECT id,email,password_salt,password_hash FROM qivora_users WHERE email=$1',[email]);
       if (!result.rowCount || typeof password!=='string' || !result.rows[0].password_hash || !result.rows[0].password_salt) return send(res,401,{error:'bad-credentials'});
