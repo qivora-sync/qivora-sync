@@ -87,6 +87,10 @@ async function initDb() {
     email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0, sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS qivora_rate_limits (
+    rate_key TEXT PRIMARY KEY, window_started TIMESTAMPTZ NOT NULL, count INTEGER NOT NULL DEFAULT 0, expires_at TIMESTAMPTZ NOT NULL
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS qivora_rate_limits_expiry ON qivora_rate_limits(expires_at)');
 
   await pool.query(`CREATE TABLE IF NOT EXISTS qivora_sync_state (
     user_id UUID PRIMARY KEY REFERENCES qivora_users(id) ON DELETE CASCADE,
@@ -149,10 +153,23 @@ function requireAuth(req) { return verifyToken((req.headers.authorization || '')
 function sha256(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
 function otpHash(email, code) { return crypto.createHmac('sha256', SECRET).update(`${email}:${code}`).digest('hex'); }
 async function sendOtpEmail(email, code) {
-  const key=process.env.RESEND_API_KEY, from=process.env.QIVORA_EMAIL_FROM;
+  const key=process.env.BREVO_API_KEY, from=process.env.QIVORA_EMAIL_FROM;
   if(!key || !from) throw Object.assign(new Error('email-provider-not-configured'),{status:503});
-  const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({from,to:[email],subject:'Код входу в QIVORA',html:`<div style="font-family:Arial,sans-serif;background:#0b1020;color:#fff;padding:28px;border-radius:16px"><h1 style="letter-spacing:4px">QIVORA</h1><p>Твій одноразовий код для входу:</p><div style="font-size:32px;font-weight:700;letter-spacing:10px;color:#67e8f9">${code}</div><p>Код діє 10 хвилин. Якщо ти не запитував його, просто проігноруй цей лист.</p></div>`})});
-  if(!response.ok) { const err=await response.text().catch(()=> ''); console.error('Resend error:',response.status,err.slice(0,300)); throw Object.assign(new Error('email-send-failed'),{status:502}); }
+  const htmlContent=`<div style="font-family:Arial,sans-serif;background:#0b1020;color:#fff;padding:28px;border-radius:16px"><h1 style="letter-spacing:4px">QIVORA</h1><p>Твій одноразовий код для входу:</p><div style="font-size:32px;font-weight:700;letter-spacing:10px;color:#67e8f9">${code}</div><p>Код діє 10 хвилин. Якщо ти не запитував його, просто проігноруй цей лист.</p></div>`;
+  const response=await fetch('https://api.brevo.com/v3/smtp/email',{method:'POST',headers:{'api-key':key,'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({sender:{email:extractSenderEmail(from),name:extractSenderName(from)},to:[{email}],subject:'Код входу в QIVORA',htmlContent})});
+  if(!response.ok) { const err=await response.text().catch(()=> ''); console.error('Brevo error:',response.status,err.slice(0,300)); throw Object.assign(new Error('email-send-failed'),{status:502}); }
+}
+function extractSenderEmail(value){const m=String(value||'').match(/<([^<>]+)>/);return (m?m[1]:String(value||'')).trim();}
+function extractSenderName(value){const m=String(value||'').match(/^\s*([^<>]+?)\s*</);return (m?m[1]:'QIVORA').trim();}
+async function dbRateLimit(key, limit, windowSeconds) {
+  const r=await pool.query(`INSERT INTO qivora_rate_limits(rate_key,window_started,count,expires_at)
+    VALUES($1,NOW(),1,NOW()+($2::text||' seconds')::interval)
+    ON CONFLICT(rate_key) DO UPDATE SET
+      count=CASE WHEN qivora_rate_limits.window_started <= NOW()-($2::text||' seconds')::interval THEN 1 ELSE qivora_rate_limits.count+1 END,
+      window_started=CASE WHEN qivora_rate_limits.window_started <= NOW()-($2::text||' seconds')::interval THEN NOW() ELSE qivora_rate_limits.window_started END,
+      expires_at=NOW()+($2::text||' seconds')::interval
+    RETURNING count, GREATEST(1,CEIL(EXTRACT(EPOCH FROM (expires_at-NOW()))))::int AS retry_after`,[key,windowSeconds]);
+  return Number(r.rows[0].count)>limit ? Number(r.rows[0].retry_after) : null;
 }
 function applePayCategory(merchant) {
   const m=String(merchant||'').toLowerCase();
@@ -247,21 +264,23 @@ const server = http.createServer(async (req,res) => {
     if (url.pathname === '/auth/email-otp/request' && req.method === 'POST') {
       const input=await body(req), email=String(input.email||'').trim().toLowerCase();
       if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length>254) return send(res,400,{error:'invalid-email'});
-      const ipWait=rateLimit(`otp-request-ip:${clientIp(req)}`,10,60*60*1000);
-      const emailWait=rateLimit(`otp-request-email:${email}`,5,60*60*1000);
+      const ipWait=await dbRateLimit(`otp-request-ip:${clientIp(req)}`,10,3600);
+      const emailWait=await dbRateLimit(`otp-request-email:${email}`,5,3600);
       if(ipWait || emailWait) return send(res,429,{error:'otp-rate-limited',retryAfter:Math.max(ipWait||0,emailWait||0)});
       const recent=await pool.query('SELECT sent_at FROM qivora_email_otps WHERE email=$1',[email]);
       if(recent.rowCount && Date.now()-new Date(recent.rows[0].sent_at).getTime()<60_000) return send(res,429,{error:'otp-rate-limited',retryAfter:60});
       const code=String(crypto.randomInt(0,1_000_000)).padStart(6,'0');
-      await sendOtpEmail(email,code);
-      await pool.query(`INSERT INTO qivora_email_otps(email,code_hash,expires_at,attempts,sent_at) VALUES($1,$2,NOW()+INTERVAL '10 minutes',0,NOW()) ON CONFLICT(email) DO UPDATE SET code_hash=EXCLUDED.code_hash,expires_at=EXCLUDED.expires_at,attempts=0,sent_at=NOW()`,[email,otpHash(email,code)]);
+      const codeHash=otpHash(email,code);
+      await pool.query(`INSERT INTO qivora_email_otps(email,code_hash,expires_at,attempts,sent_at) VALUES($1,$2,NOW()+INTERVAL '10 minutes',0,NOW()) ON CONFLICT(email) DO UPDATE SET code_hash=EXCLUDED.code_hash,expires_at=EXCLUDED.expires_at,attempts=0,sent_at=NOW()`,[email,codeHash]);
+      try { await sendOtpEmail(email,code); }
+      catch(error) { await pool.query('DELETE FROM qivora_email_otps WHERE email=$1 AND code_hash=$2',[email,codeHash]).catch(()=>{}); throw error; }
       return send(res,200,{ok:true,expiresIn:600});
     }
     if (url.pathname === '/auth/email-otp/verify' && req.method === 'POST') {
       const input=await body(req), email=String(input.email||'').trim().toLowerCase(), code=String(input.code||'').trim();
       if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(code)) return send(res,400,{error:'invalid-code'});
-      const ipWait=rateLimit(`otp-verify-ip:${clientIp(req)}`,20,15*60*1000);
-      const emailWait=rateLimit(`otp-verify-email:${email}`,10,15*60*1000);
+      const ipWait=await dbRateLimit(`otp-verify-ip:${clientIp(req)}`,20,900);
+      const emailWait=await dbRateLimit(`otp-verify-email:${email}`,10,900);
       if(ipWait || emailWait) return send(res,429,{error:'otp-verify-rate-limited',retryAfter:Math.max(ipWait||0,emailWait||0)});
       const client=await pool.connect(); let user;
       try {

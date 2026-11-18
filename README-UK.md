@@ -92,3 +92,13 @@ Endpoint response follows the existing QIVORA auth shape:
 This credential-post flow does not use an OAuth redirect URI, so the Google Cloud OAuth web client can leave "Authorized redirect URIs" empty. Keep the QIVORA Netlify origin in "Authorized JavaScript origins". Do not expose a Google Client Secret in frontend code; this flow does not require one.
 
 Existing accounts with the same verified email are signed into the same QIVORA user record. New Google users receive a QIVORA user record and an empty sync snapshot. This does not merge a separate guest/local snapshot automatically; guest-data migration remains a separate frontend workflow.
+
+
+## QIVORA Sync 2.5.0 — Brevo Email OTP
+- Email OTP is delivered through Brevo Transactional Email API (`POST https://api.brevo.com/v3/smtp/email`).
+- Required Render variables: `BREVO_API_KEY`, `QIVORA_EMAIL_FROM` (verified Brevo sender), existing database/JWT/CORS variables.
+- Existing OTP endpoints and response shapes are unchanged.
+- OTP is written before attempting delivery and removed if Brevo rejects the send.
+- OTP request/verification rate-limit counters are persisted in PostgreSQL (`qivora_rate_limits`). Existing user, sync, OTP, passkey and Apple Pay tables are not dropped.
+- Resend is no longer used by this backend. Keep its old Render variable temporarily until the deployment is verified; it is ignored by this version.
+- Sender email must be an exact sender verified/accepted by Brevo. Gmail sender identity may have deliverability limitations; verify with real recipient tests.
