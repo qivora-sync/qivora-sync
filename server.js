@@ -10,6 +10,7 @@ const PORT = Number(process.env.PORT || 8787);
 const SECRET = process.env.QIVORA_JWT_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const OCR_SPACE_API_KEY = String(process.env.OCR_SPACE_API_KEY || '').trim();
 const RP_ID = process.env.QIVORA_RP_ID || 'qivora-semolina-8700b2.netlify.app';
 const RP_IDS = String(process.env.QIVORA_RP_IDS || RP_ID).split(',').map(x=>x.trim()).filter(Boolean);
 const WEB_ORIGINS = String(process.env.QIVORA_WEB_ORIGINS || process.env.QIVORA_WEB_ORIGIN || 'https://qivora-semolina-8700b2.netlify.app').split(',').map(x=>x.trim()).filter(Boolean);
@@ -209,6 +210,42 @@ const server = http.createServer(async (req,res) => {
   try {
     if (url.pathname === '/health' && req.method === 'GET') {
       await pool.query('SELECT 1'); return send(res,200,{ ok:true, database:'connected' });
+    }
+    // Server-side OCR.space proxy. The API key never leaves Render; guest scans are
+    // supported, with per-IP throttling and strict image/type/size validation.
+    if (url.pathname === '/ocr/accurate' && req.method === 'POST') {
+      const wait=rateLimit(`ocr-ip:${clientIp(req)}`,12,15*60*1000);
+      if(wait) return send(res,429,{error:'rate-limited',retryAfter:wait});
+      if(!OCR_SPACE_API_KEY) return send(res,503,{error:'ocr-not-configured'});
+      const input=await body(req);
+      const mime=String(input.mimeType||'image/jpeg').toLowerCase();
+      if(!['image/jpeg','image/png','image/webp','image/tiff','application/pdf'].includes(mime)) return send(res,415,{error:'unsupported-file-type'});
+      const encoded=String(input.fileBase64||'').replace(/^data:[^,]+,/, '');
+      if(!encoded || encoded.length>1_300_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) return send(res,413,{error:'file-too-large-or-invalid'});
+      const bytes=Buffer.from(encoded,'base64');
+      if(!bytes.length || bytes.length>950*1024) return send(res,413,{error:'file-too-large'});
+      const form=new FormData();
+      form.append('file',new Blob([bytes],{type:mime}),String(input.filename||'qivora-scan').replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,100));
+      form.append('language','auto');
+      form.append('isOverlayRequired','false');
+      form.append('isTable','true');
+      form.append('scale','true');
+      form.append('OCREngine','2');
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),55000);
+      let upstream;
+      try {
+        upstream=await fetch('https://api.ocr.space/parse/image',{method:'POST',headers:{apikey:OCR_SPACE_API_KEY},body:form,signal:controller.signal});
+      } catch(e) {
+        return send(res,e.name==='AbortError'?504:502,{error:e.name==='AbortError'?'ocr-timeout':'ocr-upstream-unavailable'});
+      } finally { clearTimeout(timer); }
+      let result;
+      try { result=await upstream.json(); } catch { return send(res,502,{error:'ocr-invalid-response'}); }
+      if(!upstream.ok) return send(res,upstream.status===429?429:502,{error:upstream.status===429?'ocr-rate-limited':'ocr-upstream-error'});
+      if(result.IsErroredOnProcessing) return send(res,422,{error:'ocr-processing-failed'});
+      const parsedText=(Array.isArray(result.ParsedResults)?result.ParsedResults:[]).map(x=>String(x.ParsedText||'')).join('\n').slice(0,50000);
+      if(!parsedText.trim()) return send(res,422,{error:'ocr-no-text'});
+      return send(res,200,{ok:true,parsedText,engine:'ocr.space'});
     }
     if (url.pathname === '/auth/google' && req.method === 'POST') {
       const wait=rateLimit(`google-auth-ip:${clientIp(req)}`,30,15*60*1000);

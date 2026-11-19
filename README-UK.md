@@ -102,3 +102,10 @@ Existing accounts with the same verified email are signed into the same QIVORA u
 - OTP request/verification rate-limit counters are persisted in PostgreSQL (`qivora_rate_limits`). Existing user, sync, OTP, passkey and Apple Pay tables are not dropped.
 - Resend is no longer used by this backend. Keep its old Render variable temporarily until the deployment is verified; it is ignored by this version.
 - Sender email must be an exact sender verified/accepted by Brevo. Gmail sender identity may have deliverability limitations; verify with real recipient tests.
+
+
+## QIVORA Sync 2.6.0 — захищений OCR.space proxy
+
+Додано `POST /ocr/accurate`: приймає стиснене зображення у JSON (`fileBase64`, `mimeType`, `filename`), передає файл до OCR.space із серверним `OCR_SPACE_API_KEY` та повертає лише розпізнаний текст. API-ключ ніколи не надсилається у Frontend. Маршрут підтримує гостьове сканування, обмежує запити до 12 на IP за 15 хвилин, дозволяє лише підтримувані MIME-типи та файли до 950 КБ, має тайм-аут upstream-запиту.
+
+У Render Environment додати `OCR_SPACE_API_KEY` (сам ключ не комітити в GitHub і не вставляти у Frontend). Після deploy перевірити `GET /health`, потім виконати тест «Точніше» у QIVORA. Якщо змінна відсутня, endpoint повертає `ocr-not-configured`; ключ не виводиться в логи.

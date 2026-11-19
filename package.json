@@ -1,8 +1,8 @@
 {
   "name": "qivora-sync",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "private": true,
-  "description": "QIVORA sync API with Brevo transactional email OTP, Google Identity, Passkeys, and local-first guest support",
+  "description": "QIVORA sync API with Brevo OTP, Google Identity, Passkeys, server-side OCR proxy, and local-first guest support",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
