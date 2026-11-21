@@ -1,0 +1,20 @@
+{
+  "name": "qivora-sync",
+  "version": "2.6.1",
+  "private": true,
+  "description": "QIVORA sync API with Brevo OTP, Google Identity, Passkeys, server-side OCR proxy, and local-first guest support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test:record-sync:backend": "node tests/sync-record-store.test.cjs && node tests/sync-record-bootstrap.test.cjs && node tests/sync-record-migration.test.cjs && node tests/sync-record-routes.test.cjs && node tests/sync-protocol-gate.test.cjs",
+    "test:record-sync": "npm run test:record-sync:backend && node ../fe/tests/sync-record-client.test.cjs && node ../fe/tests/sync-record-bridge.test.cjs && node ../fe/tests/sync-record-runtime.test.cjs && node ../fe/tests/sync-record-integration.test.cjs && node ../fe/tests/sync-protocol-gate-client.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "@simplewebauthn/server": "^13.2.3",
+    "google-auth-library": "^9.15.1"
+  }
+}
