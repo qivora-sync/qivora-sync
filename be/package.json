@@ -1,0 +1,25 @@
+{
+  "name": "qivora-sync",
+  "version": "2.9.2.2",
+  "private": true,
+  "description": "QIVORA sync API with hardened code-based family space invitations",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test:record-sync:backend": "node tests/sync-record-store.test.cjs && node tests/sync-record-bootstrap.test.cjs && node tests/sync-record-migration.test.cjs && node tests/sync-record-routes.test.cjs && node tests/sync-protocol-gate.test.cjs",
+    "test:record-sync": "npm run test:record-sync:backend && node ../fe/tests/sync-record-client.test.cjs && node ../fe/tests/sync-record-bridge.test.cjs && node ../fe/tests/sync-record-runtime.test.cjs && node ../fe/tests/sync-record-integration.test.cjs && node ../fe/tests/sync-protocol-gate-client.test.cjs",
+    "test:shared-access": "node tests/shared-access-store.test.cjs",
+    "test:all": "npm run test:record-sync:backend && npm run test:shared-access && npm run test:workspace-sync && npm run test:workspace-import-preview",
+    "test:workspace-sync": "node tests/workspace-record-sync.test.cjs",
+    "test:workspace-import-preview": "node tests/workspace-import-preview.test.cjs",
+    "test:code-invites": "node tests/shared-access-store.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "@simplewebauthn/server": "^13.2.3",
+    "google-auth-library": "^9.15.1"
+  }
+}
